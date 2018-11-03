@@ -27,13 +27,12 @@ class Conac {
     this.setConfig(config);
     this.setErrors(errors);
     this.setEvents(events);
-    this.setRoutes(routes);
-
-    this.callEvent('routesDone');
 
     this.setPlugin(plugin);
     this.callEvent('pluginDone');
 
+    this.setRoutes(routes);
+    this.callEvent('routesDone');
 
     if (startImmediately) {
       this.listen();
@@ -55,26 +54,12 @@ class Conac {
     const plugins = arraify(maybePlugins);
 
     plugins.forEach((maybePlugin) => {
-      let plugin;
-      if (maybePlugin instanceof String) {
-        try {
-          plugin = require(maybePlugin);
-        } catch (e) {
-          console.error(`conac plugins: something is wrong with ${maybePlugin}. Make sure you "npm i"ed it first, or that it exports without errors`);
-          throw e;
-        }
-      } else {
-        plugin = maybePlugin;
-      }
-
-      if (plugin instanceof Function) {
-        plugin(this);
-        return;
-      }
+      const plugin = parsePlugin(maybePlugin);
 
       const {
         middleware = [],
         onapp = noop,
+        onconac = noop,
         beforeAcc = noop,
         before = noop,
         after = noop,
@@ -90,15 +75,19 @@ class Conac {
         this.app.use(fn());
       });
 
+      arraify(onconac).forEach((fn) => {
+        fn(this, plugin);
+      })
+
       arraify(onapp).forEach((fn) => {
-        fn(this.app);
+        fn(this.app, plugin);
       });
 
       // NOTE: these all go before previous events, not after
-      this.events.beforeAcc.unshift(...beforeAcc);
-      this.events.before.unshift(...before);
-      this.events.after.unshift(...after);
-      this.events.afterAcc.unshift(...afterAcc);
+      this.events.beforeAcc.unshift(...arraify(beforeAcc));
+      this.events.before.unshift(...arraify(before));
+      this.events.after.unshift(...arraify(after));
+      this.events.afterAcc.unshift(...arraify(afterAcc));
     });
   }
 
@@ -209,7 +198,7 @@ class Conac {
         }
 
         this.app[method](newPath, async (req, res) => {
-          await this.useFns(this.events.beforeAcc, req, res);
+          await this.useRawFns(this.events.beforeAcc, req, res);
 
           const acc = {
             raw: {
@@ -240,6 +229,7 @@ class Conac {
             await this.useFns(routeAfter, acc);
             await this.useFns(baseAfter, acc);
             await this.useFns(this.events.after, acc);
+            await this.useRawFns(this.events.afterAcc, req, res);
 
             // something needs to have returned by this point
             console.error('ERROR: nothing sent');
@@ -262,6 +252,17 @@ class Conac {
       });
   }
 
+  async useRawFns(maybeFns, ...params) {
+    const fns = arraify(maybeFns);
+
+    for (const fn of fns) {
+      const data = await fn(...params);
+
+      if (data !== undefined) {
+        sendBlock(data);
+      }
+    }
+  }
   async useFns(maybeFns, acc) {
     const fns = arraify(maybeFns);
 
@@ -384,6 +385,43 @@ const getHandler = (obj) => {
     }
   }
 };
+const parsePlugin = (plugin, params = {}) => {
+  if (typeof plugin === 'string') {
+    let extracted;
+    try {
+      extracted = require(plugin);
+    } catch (e) {
+      console.error(`conac plugins: something is wrong with ${plugin}. Make sure you "npm i"ed it first, or that it exports without errors`);
+      throw e;
+    }
+    return parsePlugin(extracted, params);
+  }
+
+  if (typeof plugin === 'function') {
+    return parsePlugin(plugin(params), params);
+  }
+
+  if (plugin.pkg) {
+    return parsePlugin(plugin.pkg, {
+      ...params,
+      ...plugin,
+    });
+  }
+
+  if (plugin.fn) {
+    // allows you to use both `this` and params
+    return parsePlugin(plugin.fn(plugin), {
+      ...plugin,
+      ...params,
+    });
+  }
+
+  return {
+    ...params,
+    ...plugin,
+  };
+};
+
 const getHandlerType = (handler) => {
   if (handler instanceof Function) {
     return 'direct';
